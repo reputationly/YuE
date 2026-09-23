@@ -245,8 +245,8 @@ tiktoken 0.12.0、safetensors 0.7.0 照上游钉（基座是 transformers 5.15�
 # 集群机器上本地构建(PyPI 不通,换源)
 docker build --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
   -f docker/Dockerfile.arm64 -t yue2:arm64-a100 .
-# CI 出包(需仓库 secrets ACR_USERNAME / ACR_PASSWORD)
-gh workflow run build-arm64.yml -R reputationly/YuE --ref main
+# CI 出包(需仓库 secrets ACR_USERNAME / ACR_PASSWORD / DOCKERHUB_USERNAME / DOCKERHUB_TOKEN)
+gh workflow run build-arm64.yml -R reputationly/YuE --ref main   # 双推 ACR + Docker Hub(arronlee/yue2)
 ```
 
 ## 11. 实测包络（A100-40G 单卡）
