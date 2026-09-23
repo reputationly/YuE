@@ -1,0 +1,92 @@
+name: Build YuE2 ARM64 image to ACR
+
+# Independent engine image for the GPUStack built-in backend "YuE2" (same shape
+# as ACE-Step-1.5 / index-tts): the YuE2 app layer on top of LightX2V's shared
+# arm64 cu130 CUDA+torch base, pushed to Aliyun ACR. Nodes never git-clone;
+# they pull this image with the code baked in.
+#
+# The base is pulled from its Docker Hub mirror: the GitHub arm64 runner is
+# overseas, and pulling Docker Hub takes ~3.5 min against ~17 min for Shanghai
+# ACR (measured by the LightX2V pipeline). docker/Dockerfile.arm64 defaults to
+# the ACR name on purpose — local/cluster builds are in China. Same digest.
+#
+# Secrets (repo Settings -> Secrets, same names and values as breeze-tts /
+# ACE-Step-1.5): ACR_USERNAME / ACR_PASSWORD
+#
+# Run: gh workflow run build-arm64.yml -R reputationly/YuE --ref main
+on:
+  workflow_dispatch:
+    inputs:
+      base_image:
+        description: "CUDA+torch base (Docker Hub mirror of lightx2v:arm64-cu130-a100-base)"
+        default: "arronlee/lightx2v:arm64-cu130-a100-base"
+        required: true
+      dest_tag:
+        description: "Floating ACR tag to publish"
+        default: "arm64-a100-latest"
+        required: true
+
+env:
+  ACR_REGISTRY: crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com
+  ACR_REPO: crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/yue2
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    # The first push uploads the whole base (~20 GB) cross-border into a new
+    # ACR repo; later pushes only the app layers. 120 min, as for vllm-omni.
+    timeout-minutes: 120
+    permissions:
+      contents: write   # GitHub Release; the default GITHUB_TOKEN is read-only (403)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # ACR's personal edition drops logins from overseas runners often enough
+      # that a single attempt fails a build now and then; retry before giving up.
+      - name: Login to Aliyun ACR
+        env:
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            echo "$ACR_PASSWORD" | docker login "$ACR_REGISTRY" -u "$ACR_USERNAME" --password-stdin && exit 0
+            echo "ACR login attempt $attempt failed; retrying in $((attempt * 15))s"
+            sleep $((attempt * 15))
+          done
+          exit 1
+
+      - name: Compute tags
+        id: tags
+        run: |
+          echo "version=arm64-a100-$(date -u +%Y%m%d-%H%M)-$(git rev-parse --short=8 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push (arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.arm64
+          platforms: linux/arm64
+          push: true
+          # ACR's personal edition rejects buildx attestation manifests
+          # ("denied: unknown manifest class"); turn both off.
+          provenance: false
+          sbom: false
+          build-args: |
+            BASE_IMAGE=${{ github.event.inputs.base_image }}
+          tags: |
+            ${{ env.ACR_REPO }}:${{ github.event.inputs.dest_tag }}
+            ${{ env.ACR_REPO }}:${{ steps.tags.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tags.outputs.version }}
+          name: YuE2 engine ${{ steps.tags.outputs.version }}
+          body: |
+            - Floating tag: `${{ env.ACR_REPO }}:${{ github.event.inputs.dest_tag }}`
+            - Immutable tag: `${{ env.ACR_REPO }}:${{ steps.tags.outputs.version }}`
+            - Base: `${{ github.event.inputs.base_image }}`
