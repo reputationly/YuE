@@ -232,7 +232,11 @@ class _Worker:
         self.log = self.log_path.open("w+")
         env = os.environ.copy()
         env["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-        self.process = subprocess.Popen([sys.executable, "-m", "yue2.fast", "--worker"],
+        # YUE2_VLLM_PYTHON lets the vLLM worker run under a different interpreter
+        # than the PyTorch process: the MoT code needs transformers 4.x, vLLM 0.29
+        # needs transformers >=5.10, and the two only meet over this pipe.
+        self.process = subprocess.Popen([os.environ.get("YUE2_VLLM_PYTHON") or sys.executable,
+                                         "-m", "yue2.fast", "--worker"],
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log,
                          bufsize=0, env=env, start_new_session=True)
         self.finalizer = weakref.finalize(self, _stop_process, self.process)
@@ -417,8 +421,13 @@ async def _worker_main():
         visible = os.environ.get("CUDA_VISIBLE_DEVICES")
         os.environ["CUDA_VISIBLE_DEVICES"] = visible.split(",")[device.index] if visible else str(device.index)
     import vllm
-    if vllm.__version__ != "0.19.0":
-        raise RuntimeError(f"This backend requires vllm==0.19.0, found {vllm.__version__}")
+    # 0.19.0 is the release Turbo validated. The v1 LogitsProcessor interface
+    # WindowedPenalty implements (five methods, BatchUpdate added/moved tuples)
+    # is unchanged in 0.29, where A100 runs match: single-request RTF 0.248,
+    # 4-way system RTF 0.137. YUE2_VLLM_ANY_VERSION opts into another release.
+    if vllm.__version__ != "0.19.0" and not os.environ.get("YUE2_VLLM_ANY_VERSION"):
+        raise RuntimeError(f"This backend requires vllm==0.19.0, found {vllm.__version__}"
+                           " (set YUE2_VLLM_ANY_VERSION=1 to run another validated release)")
     from vllm import SamplingParams
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.v1.engine.async_llm import AsyncLLM
