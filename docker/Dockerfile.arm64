@@ -1,30 +1,31 @@
-# YuE2 —— ARM64 / A100 引擎镜像(GPUStack 内置后端 YuE2)
+# YuE2 —— ARM64 / A100 引擎镜像(GPUStack 内置后端 YuE2,YuE2-Turbo 加速)
 #
-# 叠在 LightX2V 的共享 cu130 基座上,与 ACE-Step / IndexTTS 同一套做法:
-#   - PyPI 的 aarch64 torch 是 CPU 轮子,集群机器上 download.pytorch.org 又只有
-#     ~50 KB/s,所以带 CUDA 的 aarch64 torch 只能从一个已经装好的基座里继承。
-#   - 基座 = Python 3.12.13 + torch 2.11.0+cu130 + ffmpeg(含 libmp3lame)。
+# 基座是 vllm-omni 镜像(Python 3.12 + torch 2.13 + vLLM 0.29 + transformers 5.14 +
+# ffmpeg/LAME),集群所有节点本来就预装它,拉 YuE2 只下 app 层。
 #
-# 与上游 pyproject 的版本差异(有意为之):
-#   torch 2.10.0 -> 继承基座 2.11.0。YuE2 在 2.13 上实测同 seed 逐 token 复现
-#                  (abc 549 / semantic 1584),2.11 夹在中间。
-#   numpy / accelerate / soundfile -> 继承基座(均为更新的小版本,API 未变)。
-#   其余照上游钉:transformers 4.57.6、huggingface-hub 0.36.2、tiktoken 0.12.0、
-#   safetensors 0.7.0。transformers 必须钉:基座是 5.15,而 YuE2 的
-#   from_pretrained(torch_dtype=...) 与 DynamicCache 用法是 4.x 的。
+# 两个解释器,各管一段(见 src/yue2/fast.py 的 YUE2_VLLM_PYTHON):
+#   /opt/venv/bin/python   主进程:HTTP、Turbo 调度器、PyTorch MoT、VAE、SheetSage2。
+#                          --system-site-packages 继承基座的 torch 2.13,只把
+#                          transformers 钉回 4.57.6 —— YuE2 与 SheetSage2 的模型代码
+#                          是 transformers 4.x 的写法。
+#   /usr/bin/python3       vLLM worker 子进程:基座原样的 vLLM 0.29 + transformers 5.14。
+#                          两者只经管道交换 token id,互不 import 对方的依赖。
+# PATH 把 venv 放在最前:GPUStack 起容器的命令写死 `python3 -m uvicorn server:app`。
 #
-# 翻唱(SheetSage2 扒谱)只多三个纯 Python 包:pretty_midi / mido / mir_eval。
-# SheetSage2 自己钉的 torch 2.8 / transformers 4.45 / numpy 1.24 是作者环境的快照,
-# 不是硬要求 —— 它在本镜像的 torch 2.11 / transformers 4.57.6 / numpy 2.5 上原样
-# 跑通(A100 实测)。numpy 1.24 连 Python 3.12 的轮子都没有,照钉就得另起一套 3.11。
-# 模型代码与权重不进镜像,跟 YuE2 权重一起放在模型目录(SheetSage2/、MERT-v2-FullSong/)。
+# venv 里的版本钉:
+#   transformers 4.57.6 / huggingface-hub 0.36.2 / tiktoken 0.12.0 —— 照上游。
+#   kernels 0.9.1(--no-deps)—— 基座的 kernels 0.16 要求 hub>=1.0,在 hub 0.36 下
+#     import 期就炸 StrictDataclassFieldValidationError,必须在 venv 里压住。
+#   pretty_midi / mido / mir_eval —— SheetSage2(翻唱扒谱)只多这三个纯 Python 包;
+#     它自己钉的 torch 2.8 / numpy 1.24 是作者环境快照,在本环境原样跑通。
+#   torch / numpy / scipy 冻结成 constraints:任何一次 pip 都不许换掉基座的版本。
 #
 # 构建:
 #   docker build -f docker/Dockerfile.arm64 -t yue2:arm64-a100 .
 # 在集群机器上本地构建时 PyPI 不通(pypi.org 实测 1 MB/15 s),要换源:
 #   --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 # CI 出包走 .github/workflows/build-arm64.yml(runner 在境外,base 从 Docker Hub 拉)。
-ARG BASE_IMAGE=crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/lightx2v:arm64-cu130-a100-base
+ARG BASE_IMAGE=crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/vllm-omni:arm64-a100-latest
 FROM ${BASE_IMAGE}
 
 # 只作用于构建期的 pip;不进镜像的运行环境。
@@ -34,36 +35,44 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    PYTHONPATH=/opt/yue2 \
     TOKENIZERS_PARALLELISM=false \
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
-    HF_HUB_DISABLE_XET=1
+    HF_HUB_DISABLE_XET=1 \
+    PATH=/opt/venv/bin:$PATH \
+    PYTHONPATH=/opt/yue2/src:/opt/yue2 \
+    YUE2_VLLM_PYTHON=/usr/bin/python3 \
+    YUE2_VLLM_ANY_VERSION=1
 
 WORKDIR /opt/yue2
 
 # 依赖层先于源码层:改代码只重跑后两层。
-# torch 冻结成 constraints —— 任何一次 pip 都不许把它换成 PyPI 的 CPU 轮子。
-# numpy/scipy 一并冻结:mir_eval 这类旧包的宽约束不许把基座的 numpy 2.x 换掉。
-RUN python3 -m pip freeze | grep -iE '^(torch|torchvision|torchaudio|numpy|scipy)==' > /opt/torch-constraints.txt \
-    && echo "=== frozen from base ===" && cat /opt/torch-constraints.txt \
-    && python3 -m pip install -c /opt/torch-constraints.txt \
+RUN /usr/bin/python3 -m pip freeze | grep -iE '^(torch|torchvision|torchaudio|numpy|scipy)==' > /opt/base-constraints.txt \
+    && echo "=== frozen from base ===" && cat /opt/base-constraints.txt \
+    && /usr/bin/python3 -m venv --system-site-packages /opt/venv \
+    && /opt/venv/bin/pip install -c /opt/base-constraints.txt \
         "transformers==4.57.6" \
         "huggingface-hub==0.36.2" \
         "tiktoken==0.12.0" \
-        "safetensors==0.7.0" \
         "pretty_midi==0.2.10" \
         "mido==1.3.3" \
         "mir_eval==0.8.2" \
-        "pytest>=8.0"
+    && /opt/venv/bin/pip install --no-deps "kernels==0.9.1"
 
+# 源码走 PYTHONPATH 而不是 pip install:两个解释器都要 import yue2(vLLM worker 是
+# `python -m yue2.fast --worker`),同一份源码对两边一样可见。
 COPY . /opt/yue2
-RUN python3 -m pip install --no-deps /opt/yue2
 
-# 构建期断言:版本钉对、CUDA 编译进去了、整条导入链完整、契约测试全过。
-# 放这里是为了让"镜像能起但一请求就崩"在出包阶段暴露,而不是等实例部署完。
+# 构建期断言:两个解释器的版本与导入链、契约测试、vLLM 适配层测试。放这里是为了
+# 让"镜像能起但一请求就崩"在出包阶段暴露,而不是等实例部署完。
+#   test_fast.py 在 vLLM 解释器下跑:它要在进程内 import vLLM,主进程的
+#   transformers 4.x 做不到。跳过的那条断言"import yue2 不连带 import triton",
+#   而 torch 2.13 在 import torch 时自己就会拉 triton(torch._native),前提不成立。
 RUN python3 docker/smoke_check_arm64.py \
-    && python3 -m pytest -q tests/test_harness_task_api.py tests/test_protocol.py
+    && CUDA_VISIBLE_DEVICES= python3 -m pytest -q -p no:cacheprovider \
+        tests/test_harness_task_api.py tests/test_protocol.py tests/test_service.py \
+    && CUDA_VISIBLE_DEVICES= /usr/bin/python3 -m pytest -q -p no:cacheprovider \
+        tests/test_fast.py -k "not optional_imports_do_not_load_cuda_extensions"
 
 EXPOSE 8000
 CMD ["python3", "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]

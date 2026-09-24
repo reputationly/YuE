@@ -48,4 +48,4 @@ yue2 = ["studio.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+pythonpath = ["src", "."]

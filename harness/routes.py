@@ -10,20 +10,24 @@ dispatch/poll/cancel without special-casing YuE2:
     GET    /v1/tasks/{id}/result     -> streams the audio (COMPLETED only)
     DELETE /v1/tasks/{id}            -> {stop_status, reason}
 
-Note: /queue/status is registered before /{task_id}/status so "queue" is not
-captured as a task_id.
+The queue itself is YuE2-Turbo's JobStore (the worker's SQLite queue); these
+routes translate its states into the facade's vocabulary. Note: /queue/status
+is registered before /{task_id}/status so "queue" is not captured as a task_id.
 """
 import json
 import logging
 import os
 import secrets
 import subprocess
+import threading
+from datetime import datetime
 from typing import Callable, Optional
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from yue2.protocol import SongRequest
+from yue2.service_store import QueueFull, TERMINAL
 
 from .schemas import (
     MAX_ABC_CHARS,
@@ -35,16 +39,121 @@ from .schemas import (
     TaskResponse,
     lyric_units,
 )
-from .task_manager import QueueFullError, TaskManager, TaskStatus
 
 logger = logging.getLogger(__name__)
+
+# Private request keys stored with each job. Turbo's generation_fields() passes
+# only the pipeline's own fields to YuE2, so these never reach the model.
+SAVE_KEY = "_save_result_path"
+REF_KEY = "_reference_audio_path"
 
 # Output container follows save_result_path's extension. The facade always asks
 # for .mp3 on the music kind; wav/flac are there for direct callers that want
 # the lossless master.
 MEDIA_TYPES = {".mp3": "audio/mpeg", ".wav": "audio/wav", ".flac": "audio/flac"}
 
+# Turbo's job states -> the facade's _ENGINE_STATE_MAP vocabulary (verbatim;
+# cancelled is double-L). "truncated" never reaches a caller: the worker fails
+# a truncated song before it is published.
+FACADE_STATUS = {
+    "queued": "pending",
+    "running": "processing",
+    "succeeded": "completed",
+    "truncated": "failed",
+    "failed": "failed",
+    "cancelled": "cancelled",
+}
 
+
+# ------------------------------------------------------------------ progress
+# Global progress, folded here rather than by the facade: the facade's music
+# table (prepare 5 / encode 10 / denoise 70 / decode 10 / save 5) does not match
+# where YuE2's time goes, and its contract lets an engine-reported global
+# ``progress`` win outright. Spans follow the measured A100 split: score ~30 %,
+# semantic ~50 %, flow matching ~12 %, VAE decode ~6 %, MP3 encode + NFS write
+# the rest. A cover spends its first ~20 % transcribing and has no planning
+# stage. Phase names stay in the facade's vocabulary as labels only.
+_TRANSCRIBE_END = 20.0
+_PLAN_SPAN = (0.0, 30.0)
+_SEMANTIC_END = 80.0
+_STAGE_FLOOR = {"synthesis": 80.0, "decode": 92.0, "saving": 97.0}
+_STAGE_PHASE = {
+    "claimed_waiting": "prepare", "transcribing": "encode", "planning": "denoise",
+    "semantic": "denoise", "synthesis": "denoise", "decode": "decode", "saving": "save",
+}
+
+# Token-count expectations, used only to pace the bar. AR stages decide their
+# own length, so the true count is unknowable until they stop. Measured on A100
+# over five songs (lyric length in harness.schemas.lyric_units): long lyrics
+# settle at ~4.2 score tokens and ~11 semantic tokens per unit, while short ones
+# get a longer arrangement than their length suggests — hence the floors. Once
+# the score exists it is the better predictor: semantic runs 2.4-2.9x the score.
+# The facade clamps an engine reading at 99 % and forces it monotonic, so an
+# estimate that is off never moves the bar backwards; it only pauses or hurries.
+_ABC_TOKENS_PER_UNIT = 4.3
+_MIN_EXPECTED_ABC = 400
+_SEMANTIC_TOKENS_PER_ABC_TOKEN = 2.7
+_SEMANTIC_TOKENS_PER_UNIT_NO_PLAN = 11.2
+_MIN_EXPECTED_SEMANTIC = 1000
+
+
+class ProgressBook:
+    """Per-task facts the progress fold needs and the job store does not keep:
+    lyric length, whether YuE2 plans the score, whether it is a cover, and the
+    high-water mark that keeps the reported value from ever moving backwards.
+    Lives as long as the process, like the store it shadows."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._tasks = {}
+
+    def register(self, task_id: str, *, units: float, planned: bool, cover: bool, save_result_path: str):
+        with self._lock:
+            self._tasks[task_id] = {"units": units, "planned": planned, "cover": cover,
+                                    "save_result_path": save_result_path, "high": None}
+
+    def get(self, task_id: str) -> Optional[dict]:
+        with self._lock:
+            return self._tasks.get(task_id)
+
+    def fold(self, task_id: str, job: dict):
+        """(phase, progress) for a running job, progress None when there is
+        nothing to say yet. Never lower than a value reported before."""
+        stage = job.get("stage")
+        phase = _STAGE_PHASE.get(stage)
+        with self._lock:
+            meta = self._tasks.get(task_id)
+            if meta is None or phase is None:
+                return phase, None
+            value = _raw_progress(stage, job.get("tokens") or {}, meta)
+            if value is not None:
+                meta["high"] = value if meta["high"] is None else max(meta["high"], value)
+            high = meta["high"]
+        return phase, (None if high is None else round(min(99.0, high), 1))
+
+
+def _raw_progress(stage: str, tokens: dict, meta: dict) -> Optional[float]:
+    if stage in _STAGE_FLOOR:
+        return _STAGE_FLOOR[stage]
+    units = meta["units"]
+    if stage == "planning":
+        expected = max(_MIN_EXPECTED_ABC, units * _ABC_TOKENS_PER_UNIT)
+        lo, hi = _PLAN_SPAN
+        return lo + (hi - lo) * min(1.0, tokens.get("abc", 0) / expected)
+    if stage == "semantic":
+        abc_tokens = tokens.get("abc", 0)
+        if meta["planned"] and abc_tokens:
+            expected = max(_MIN_EXPECTED_SEMANTIC, abc_tokens * _SEMANTIC_TOKENS_PER_ABC_TOKEN)
+        else:
+            expected = max(_MIN_EXPECTED_SEMANTIC, units * _SEMANTIC_TOKENS_PER_UNIT_NO_PLAN)
+        start = _PLAN_SPAN[1] if meta["planned"] else (_TRANSCRIBE_END if meta["cover"] else 0.0)
+        return start + (_SEMANTIC_END - start) * min(1.0, tokens.get("semantic", 0) / expected)
+    # claimed_waiting / transcribing: nothing measurable yet (the facade falls
+    # back to its elapsed-time estimate).
+    return None
+
+
+# ---------------------------------------------------------------- validation
 def probe_duration(path: str) -> Optional[float]:
     """Duration in seconds via ffprobe, or None when the file cannot be read."""
     try:
@@ -144,54 +253,110 @@ def validate_request(message: MusicTaskRequest, cover_enabled: bool = False) -> 
         raise HTTPException(status_code=400, detail=str(e))
 
 
-def create_tasks_router(
-    task_manager: TaskManager, cover_enabled: Callable[[], bool] = lambda: False
-) -> APIRouter:
+def _job_request(message: MusicTaskRequest) -> dict:
+    request = {"style": message.style_text(), "lyrics": message.lyrics_text(),
+               "cot": message.cot_mode(), "seed": message.seed, SAVE_KEY: message.save_result_path}
+    if message.abc_text() is not None:
+        request["abc"] = message.abc_text()
+    if message.cfg_scale is not None:
+        request["cfg_scale"] = message.cfg_scale
+    if message.is_cover():
+        request[REF_KEY] = message.reference_audio_path
+    return request
+
+
+def _timestamp(value):
+    return datetime.fromtimestamp(value) if value else None
+
+
+# -------------------------------------------------------------------- routes
+def create_tasks_router(get_worker: Callable[[], object], book: ProgressBook) -> APIRouter:
+    """``get_worker`` returns the running HarnessWorker (None before startup):
+    the router is built at import time, the worker only in the app lifespan."""
     router = APIRouter(prefix="/v1/tasks", tags=["tasks"])
+
+    def worker_or_503():
+        worker = get_worker()
+        if worker is None or not worker.ready:
+            raise HTTPException(status_code=503, detail="engine is still loading")
+        return worker
 
     # The facade posts to /v1/tasks/{engine_kind}/; t2m and cover both resolve
     # to "music".
     @router.post("/music/", response_model=TaskResponse)
     @router.post("/audio/", response_model=TaskResponse)
     async def create_music_task(message: MusicTaskRequest):
-        validate_request(message, cover_enabled())
+        worker = worker_or_503()
+        validate_request(message, worker.cover_transcriber is not None)
         # Pin the seed at submit time so a retried or re-read task is
         # reproducible and the sidecar records what was actually used. Upstream
         # defaults every request to seed 831001, which would make the same
         # prompt produce the same song for every caller.
         if message.seed is None:
             message.seed = secrets.randbelow(2**31)
+        request = _job_request(message)
         try:
-            task_id = task_manager.create_task(message)
-        except QueueFullError as e:  # queue full -> backpressure (retryable)
-            raise HTTPException(status_code=503, detail=str(e))
-        except RuntimeError as e:  # e.g. duplicate task id -> client error, no retry
-            raise HTTPException(status_code=400, detail=str(e))
-        except Exception as e:  # noqa: BLE001
-            logger.error(f"Failed to create music task: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
-        message.task_id = task_id
-        return TaskResponse(
-            task_id=task_id,
-            task_status="pending",
-            save_result_path=message.save_result_path,
-        )
+            job, _ = worker.store.submit(request, worker.settings.max_pending)
+        except QueueFull as e:  # queue full -> backpressure (retryable)
+            raise HTTPException(status_code=503, detail=f"Task queue is full (max {worker.settings.max_pending} tasks)") from e
+        book.register(job["id"], units=lyric_units(request["lyrics"]),
+                      planned=request["cot"] != "off" and "abc" not in request and not message.is_cover(),
+                      cover=message.is_cover(), save_result_path=message.save_result_path)
+        worker.wake.set()
+        return TaskResponse(task_id=job["id"], task_status="pending",
+                            save_result_path=message.save_result_path)
 
     @router.get("/queue/status")
     async def get_queue_status():
-        active = task_manager.get_active_task_count()
+        worker = get_worker()
+        if worker is None:
+            raise HTTPException(status_code=503, detail="engine is still loading")
+        snapshot = worker.store.load_snapshot()
+        running = [item["id"] for item in snapshot["items"] if item["stage"] != "queued"]
+        active = snapshot["active_requests"] + snapshot["queue_depth"]
+        size = worker.settings.max_pending
         return {
-            "is_processing": task_manager.is_processing(),
-            "current_task": task_manager.current_task,
-            "pending_count": task_manager.get_pending_task_count(),
+            "is_processing": snapshot["active_requests"] > 0,
+            "current_task": running[0] if running else None,
+            "pending_count": snapshot["queue_depth"],
             "active_count": active,
-            "queue_size": task_manager.max_queue_size,
-            "queue_available": task_manager.max_queue_size - active,
+            "queue_size": size,
+            "queue_available": size - active,
         }
+
+    def facade_status(task_id: str) -> Optional[dict]:
+        worker = get_worker()
+        job = worker.store.get(task_id) if worker is not None else None
+        if job is None:
+            return None
+        meta = book.get(task_id) or {}
+        status = FACADE_STATUS.get(job["status"], "processing")
+        # A DELETE is immediate from the caller's side (the old in-memory queue
+        # flipped to cancelled at once); the worker notices within one token or
+        # flow step, or after the current transcription.
+        if job.get("cancel_requested") and job["status"] not in TERMINAL:
+            status = "cancelled"
+        error = job.get("error") or {}
+        payload = {
+            "task_id": task_id,
+            "status": status,
+            "start_time": _timestamp(job.get("started_at")),
+            "end_time": _timestamp(job.get("finished_at")),
+            "error": error.get("message") or ("Task cancelled by user" if status == "cancelled" else None),
+            "error_type": error.get("code") or "",
+            "save_result_path": (job.get("result") or {}).get("save_result_path") or meta.get("save_result_path"),
+        }
+        if job["status"] == "running" and status == "processing":
+            phase, progress = book.fold(task_id, job)
+            if phase is not None:
+                payload["phase"] = phase
+            if progress is not None:
+                payload["progress"] = progress
+        return payload
 
     @router.get("/{task_id}/status")
     async def get_task_status(task_id: str):
-        status = task_manager.get_task_status(task_id)
+        status = facade_status(task_id)
         if not status:
             # 404 is how the facade sweeper detects a lost engine task (instance
             # restarted) and re-dispatches it. Any other code strands the task.
@@ -200,10 +365,10 @@ def create_tasks_router(
 
     @router.get("/{task_id}/result")
     async def get_task_result(task_id: str):
-        status = task_manager.get_task_status(task_id)
+        status = facade_status(task_id)
         if not status:
             raise HTTPException(status_code=404, detail="Task not found")
-        if status.get("status") != TaskStatus.COMPLETED.value:
+        if status["status"] != "completed":
             raise HTTPException(status_code=404, detail="Task not completed")
         path = status.get("save_result_path")
         if not path or not os.path.isfile(path):
@@ -220,11 +385,14 @@ def create_tasks_router(
 
     @router.delete("/{task_id}", response_model=StopTaskResponse)
     async def stop_task(task_id: str):
+        worker = get_worker()
         try:
-            if task_manager.cancel_task(task_id):
-                logger.info(f"Task {task_id} cancelled.")
-                return StopTaskResponse(stop_status="success", reason="Task stopped successfully.")
-            return StopTaskResponse(stop_status="do_nothing", reason="Task not found or already completed.")
+            job = worker.store.get(task_id) if worker is not None else None
+            if job is None or job["status"] in TERMINAL or job.get("cancel_requested"):
+                return StopTaskResponse(stop_status="do_nothing", reason="Task not found or already completed.")
+            worker.cancel(task_id)
+            logger.info(f"Task {task_id} cancelled.")
+            return StopTaskResponse(stop_status="success", reason="Task stopped successfully.")
         except Exception as e:  # noqa: BLE001
             logger.error(f"Error cancelling task {task_id}: {e}")
             return StopTaskResponse(stop_status="error", reason=str(e))

@@ -1,9 +1,10 @@
 name: Build YuE2 ARM64 image to ACR + Docker Hub
 
 # Independent engine image for the GPUStack built-in backend "YuE2" (same shape
-# as breeze-tts / ACE-Step-1.5): the YuE2 app layer on top of LightX2V's shared
-# arm64 cu130 CUDA+torch base. Nodes never git-clone; they pull this image with
-# the code baked in.
+# as breeze-tts / ACE-Step-1.5): YuE2-Turbo + the task harness on top of the
+# vllm-omni image (torch 2.13 + vLLM 0.29), which every node already has, so a
+# node pulls only the app layers. Nodes never git-clone; they pull this image
+# with the code baked in.
 #
 # Dual push, as breeze-tts does: Aliyun ACR is what production nodes pull;
 # Docker Hub keeps a copy that GitHub runners (overseas) can pull fast.
@@ -11,7 +12,12 @@ name: Build YuE2 ARM64 image to ACR + Docker Hub
 # The base is pulled from its Docker Hub mirror: the GitHub arm64 runner is
 # overseas, and pulling Docker Hub takes ~3.5 min against ~17 min for Shanghai
 # ACR (measured by the LightX2V pipeline). docker/Dockerfile.arm64 defaults to
-# the ACR name on purpose — local/cluster builds are in China. Same digest.
+# the ACR name on purpose — local/cluster builds are in China.
+#
+# ACR push speed from GitHub runs ~1 MB/s, and the first push into a repo whose
+# base layers differ uploads the whole base. After a base change, push once from
+# a cluster node (in-region: a 23.9 GB image took 107 s) so this job only has
+# the app layers left to send.
 #
 # Secrets (repo Settings -> Secrets, same names and values as breeze-tts):
 #   ACR_USERNAME / ACR_PASSWORD
@@ -22,8 +28,8 @@ on:
   workflow_dispatch:
     inputs:
       base_image:
-        description: "CUDA+torch base (Docker Hub mirror of lightx2v:arm64-cu130-a100-base)"
-        default: "arronlee/lightx2v:arm64-cu130-a100-base"
+        description: "Base image (Docker Hub mirror of vllm-omni:arm64-a100-latest)"
+        default: "arronlee/vllm-omni:arm64-a100-latest"
         required: true
       dest_tag:
         description: "Floating ACR tag to publish"
@@ -38,8 +44,8 @@ env:
 jobs:
   build:
     runs-on: ubuntu-24.04-arm
-    # The first push uploads the whole base (~20 GB) cross-border into a new
-    # ACR repo; later pushes only the app layers. 120 min, as for vllm-omni.
+    # App layers only once the base is in the ACR repo (see above); 120 min
+    # covers a slow ACR day, as for vllm-omni.
     timeout-minutes: 120
     permissions:
       contents: write   # GitHub Release; the default GITHUB_TOKEN is read-only (403)
