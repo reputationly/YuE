@@ -5,6 +5,7 @@ from contextlib import contextmanager, nullcontext
 from pathlib import Path
 import dataclasses
 import json
+import threading
 import time
 import numpy as np
 import torch
@@ -72,6 +73,24 @@ class SemanticResult:
 
 
 @dataclass
+class ARResult:
+    """Completed autoregressive stages, ready for serialized NAR/VAE rendering."""
+    semantic: SemanticResult
+    config: dict
+    request_identity: str
+    started_at: float
+
+
+@dataclass
+class NARResult:
+    """Completed acoustic flow matching, ready for serial VAE decoding."""
+    ar: ARResult
+    latents: np.ndarray
+    seconds: float
+    batch_size: int = 1
+
+
+@dataclass
 class SongResult:
     audio: np.ndarray
     sample_rate: int
@@ -121,7 +140,15 @@ class SongResult:
 class YuE2Pipeline:
     def __init__(self, model_dir, vae_dir, *, device="auto", memory_budget_gib=24,
                  backend="torch", generation_config=None, verify_hashes=True,
-                 vae_core_frames=None, quantization="none", offload_ar=False, progress=True):
+                 vae_core_frames=None, quantization="none", offload_ar=False, progress=True,
+                 resident_models=False, vllm_max_num_seqs=4,
+                 vllm_max_num_batched_tokens=8192,
+                 vllm_gpu_memory_utilization=.3):
+        if not isinstance(resident_models, bool):
+            raise TypeError("resident_models must be True or False")
+        if resident_models and offload_ar:
+            raise ValueError("resident_models requires offload_ar=False")
+        self.resident_models = resident_models
         if not isinstance(progress, bool):
             raise TypeError("progress must be True or False")
         self.progress = progress
@@ -131,6 +158,14 @@ class YuE2Pipeline:
             raise ValueError("quantization must be none or fp8")
         if not 0 < memory_budget_gib:
             raise ValueError("memory_budget_gib must be positive")
+        if isinstance(vllm_max_num_seqs, bool) or not isinstance(vllm_max_num_seqs, int) or vllm_max_num_seqs < 1:
+            raise ValueError("vllm_max_num_seqs must be a positive integer")
+        if (isinstance(vllm_max_num_batched_tokens, bool)
+                or not isinstance(vllm_max_num_batched_tokens, int)
+                or not 1 <= vllm_max_num_batched_tokens <= 24576):
+            raise ValueError("vllm_max_num_batched_tokens must be in [1, 24576]")
+        if not 0 < float(vllm_gpu_memory_utilization) <= .9:
+            raise ValueError("vllm_gpu_memory_utilization must be in (0, 0.9]")
         if device == "auto":
             device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
         self.device = torch.device(device)
@@ -144,6 +179,10 @@ class YuE2Pipeline:
         torch.set_float32_matmul_precision("highest")
         self.model_dir, self.vae_dir = Path(model_dir), Path(vae_dir)
         self.backend, self.quantization = backend, quantization
+        self.vllm_max_num_seqs = vllm_max_num_seqs
+        self.vllm_max_num_batched_tokens = vllm_max_num_batched_tokens
+        self.vllm_gpu_memory_utilization = float(vllm_gpu_memory_utilization)
+        self._vllm_start_lock = threading.Lock()
         self.memory_budget_gib = float(memory_budget_gib)
         self.vae_core_frames = vae_core_frames if vae_core_frames is not None else (512 if memory_budget_gib <= 12 else 1024)
         self.offload_ar = offload_ar
@@ -284,9 +323,6 @@ class YuE2Pipeline:
 
     def synthesize(self, semantic, *, cancelled=None):
         from .nar import synthesize
-        if self.backend == "vllm":
-            from .fast import close_vllm
-            close_vllm(self)
         if not isinstance(semantic, SemanticResult):
             raise TypeError("Pass the SemanticResult returned by generate_semantic()")
         if token_prefixes(semantic.plan.request, self.tokenizer, semantic.plan.abc_ids) != semantic.plan.prefix:
@@ -311,18 +347,40 @@ class YuE2Pipeline:
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
 
+    def preload(self):
+        """Load reusable weights and start the persistent AR engine before traffic."""
+        from .modeling_vae import YuE2VAE
+        if self.backend == "vllm":
+            from .fast import preload_vllm
+            preload_vllm(self)
+            if self.resident_models:
+                # Acoustic synthesis needs the MoT AR path for prefix prefill as
+                # well as its NAR path, so keep the complete PyTorch model.
+                self._load_model(for_nar=True)
+        else:
+            self._load_model()
+        if self._vae is None:
+            self._vae = YuE2VAE.from_pretrained(self.vae_dir, decoder_only=True,
+                                              device="cpu", local_files_only=True)
+        if self.resident_models:
+            self._vae.to(self.device)
+        synchronize(self.device)
+
     def __enter__(self):
         return self
 
     def __exit__(self, *exc):
         self.close()
 
-    def decode(self, latents, *, full=False, vae=None):
+    def decode(self, latents, *, full=False, vae=None, cancelled=None):
         from .modeling_vae import YuE2VAE
+        resident = getattr(self, "resident_models", False)
+        if cancelled is not None and cancelled():
+            raise InterruptedError("Cancelled before audio decode")
         with self._status("Loading audio decoder"):
-            if self._model is not None:
+            if self._model is not None and not resident:
                 self._model.to("cpu")
-            if self.device.type == "cuda":
+            if self.device.type == "cuda" and not resident:
                 torch.cuda.empty_cache()
             if vae is not None:
                 model = YuE2VAE.from_pretrained(vae, decoder_only=True, device=self.device)
@@ -339,7 +397,13 @@ class YuE2Pipeline:
         try:
             tiles = 1 if full else (z.shape[-1] + self.vae_core_frames - 1) // self.vae_core_frames
             with self._status("Decoding audio", total=tiles, unit="chunks") as status:
-                report = (lambda completed, total: status.update(completed, total=total)) if self.progress else None
+                report = None
+                if self.progress or cancelled is not None:
+                    def report(completed, total):
+                        if cancelled is not None and cancelled():
+                            raise InterruptedError("Cancelled during audio decode")
+                        if self.progress:
+                            status.update(completed, total=total)
                 with torch.inference_mode():
                     if full:
                         audio = model.decode(z.to(self.device)).cpu()
@@ -351,8 +415,9 @@ class YuE2Pipeline:
                     raise ValueError("VAE produced non-finite audio")
                 return audio[0].float().clamp(-1, 1).T.contiguous().numpy()
         finally:
-            model.to("cpu")
-            if self.device.type == "cuda":
+            if not resident or vae is not None:
+                model.to("cpu")
+            if self.device.type == "cuda" and not resident:
                 torch.cuda.empty_cache()
 
     def effective_config(self, request, abc_sampling=None, semantic_sampling=None):
@@ -371,28 +436,156 @@ class YuE2Pipeline:
                 "model_dtype": "bfloat16", "vae_dtype": "float32", "vae_decode": "halo_crop",
                 "vae_core_frames": self.vae_core_frames, "vae_halo_frames": 16,
                 "device": str(self.device), "memory_budget_gib": self.memory_budget_gib,
-                "offload_ar": self.offload_ar, "runtime_sha256": self.runtime_sha256,
+                "offload_ar": self.offload_ar, "resident_models": getattr(self, "resident_models", False),
+                "vllm_max_num_seqs": self.vllm_max_num_seqs if self.backend == "vllm" else None,
+                "vllm_max_num_batched_tokens": (
+                    self.vllm_max_num_batched_tokens if self.backend == "vllm" else None),
+                "vllm_gpu_memory_utilization": (
+                    self.vllm_gpu_memory_utilization if self.backend == "vllm" else None),
+                "runtime_sha256": self.runtime_sha256,
                 "decoder_release": json.loads((self.vae_dir / "config.json").read_text()).get("release_variant"),
                 "validation_status": "unvalidated"}
 
-    def __call__(self, style=None, lyrics=None, *, tags=None, abc_sampling=None,
-                 semantic_sampling=None, cancelled=None, on_token=None, **kwargs):
+    def parallel_ar_eligible(self, request):
+        """Whether this request can stay entirely on the concurrent vLLM AR path."""
+        if not isinstance(request, SongRequest):
+            request = SongRequest(**request)
+        return (self.backend == "vllm" and self.device.type == "cuda" and self.quantization == "none"
+                and request.cot in {"full", "melody"} and request.guidance == 1)
+
+    def generate_ar(self, style=None, lyrics=None, *, tags=None, abc_sampling=None,
+                    semantic_sampling=None, cancelled=None, on_token=None, on_stage=None, **kwargs):
+        """Run score planning and semantic-token AR; safe to batch through vLLM."""
         request = self._request(style, lyrics, tags=tags, **kwargs)
         config = self.effective_config(request, abc_sampling, semantic_sampling)
         request_id = identity({"request": request.to_dict(), "config": config, "weights": self.weights})
         start = time.perf_counter()
+        if on_stage is not None:
+            on_stage("planning")
         plan = self.plan(request=request, abc_sampling=abc_sampling, cancelled=cancelled, on_token=on_token)
+        if on_stage is not None:
+            on_stage("semantic")
         semantic = self.generate_semantic(plan, sampling=semantic_sampling, cancelled=cancelled, on_token=on_token)
+        return ARResult(semantic, config, request_id, start)
+
+    def render_ar(self, ar_result, *, cancelled=None, on_stage=None):
+        """Run the non-AR acoustic stages for a completed AR result."""
+        if not isinstance(ar_result, ARResult):
+            raise TypeError("Pass the ARResult returned by generate_ar()")
+        if on_stage is not None:
+            on_stage("synthesis")
         nar_start = time.perf_counter()
-        latents = self.synthesize(semantic, cancelled=cancelled)
-        nar_seconds = time.perf_counter() - nar_start
+        try:
+            latents = self.synthesize(ar_result.semantic, cancelled=cancelled)
+        except torch.OutOfMemoryError as error:
+            torch.cuda.empty_cache()
+            raise MemoryError("NAR exceeded its runtime GPU allocation") from error
+        nar_result = NARResult(ar_result, latents, time.perf_counter() - nar_start)
+        return self.render_nar(nar_result, cancelled=cancelled, on_stage=on_stage)
+
+    def nar_batch_admission(self, ar_results):
+        """Estimate a FIFO NAR window before allocating padded KV caches."""
+        from .nar import nar_batch_memory_estimate, song_chunks
+        if not ar_results or any(not isinstance(result, ARResult) for result in ar_results):
+            raise ValueError("NAR admission requires at least one ARResult")
+        try:
+            model = self._load_model(for_nar=True)
+        except torch.OutOfMemoryError as error:
+            torch.cuda.empty_cache()
+            raise MemoryError("NAR admission could not load the acoustic model") from error
+        songs = [
+            song_chunks(result.semantic.plan.prefix, result.semantic.tokens,
+                        result.semantic.plan.request.seed, self.generation_config.context)
+            for result in ar_results
+        ]
+        return nar_batch_memory_estimate(model, songs)
+
+    def generate_nar_batch(self, ar_results, *, cancelled=None, on_stage=None):
+        """Run padded shared-forward NAR and preserve row order."""
+        from .nar import synthesize_batch
+        ar_results = list(ar_results)
+        if len(ar_results) < 2 or any(not isinstance(result, ARResult) for result in ar_results):
+            raise ValueError("NAR batching requires at least two ARResult objects")
+        callbacks = list(cancelled or [None] * len(ar_results))
+        stages = list(on_stage or [None] * len(ar_results))
+        if len(callbacks) != len(ar_results) or len(stages) != len(ar_results):
+            raise ValueError("NAR batch callbacks must align with results")
+        admission = self.nar_batch_admission(ar_results)
+        if not admission["allowed"]:
+            raise MemoryError("NAR batch does not leave the required GPU memory reserve")
+        values, active = [None] * len(ar_results), []
+        for row, (callback, stage) in enumerate(zip(callbacks, stages)):
+            try:
+                if callback is not None and callback():
+                    raise InterruptedError("Cancelled before acoustic flow matching")
+                if stage is not None:
+                    stage("synthesis")
+            except Exception as error:
+                values[row] = error
+            else:
+                active.append(row)
+        if not active:
+            return values
+        model = self._load_model(for_nar=True)
+        started = time.perf_counter()
+        try:
+            latents = synthesize_batch(
+                model,
+                [ar_results[row].semantic.plan.prefix for row in active],
+                [ar_results[row].semantic.tokens for row in active],
+                [ar_results[row].semantic.plan.request.seed for row in active],
+                steps=self.generation_config.ode_steps, context=self.generation_config.context,
+                cancelled=[callbacks[row] for row in active],
+            )
+        except torch.OutOfMemoryError as error:
+            torch.cuda.empty_cache()
+            raise MemoryError("NAR batch exceeded its runtime GPU allocation") from error
+        seconds = time.perf_counter() - started
+        for row, value in zip(active, latents):
+            values[row] = (
+                value if isinstance(value, Exception)
+                else NARResult(ar_results[row], value.detach().float().cpu().numpy(),
+                               seconds, len(active))
+            )
+        return values
+
+    def render_nar(self, nar_result, *, cancelled=None, on_stage=None):
+        """Decode one completed NAR result; VAE intentionally remains serial."""
+        if not isinstance(nar_result, NARResult):
+            raise TypeError("Pass the NARResult returned by the acoustic stage")
+        ar_result, latents = nar_result.ar, nar_result.latents
+        semantic = ar_result.semantic
         if cancelled is not None and cancelled():
             raise InterruptedError("Cancelled before VAE")
         vae_start = time.perf_counter()
-        audio = self.decode(latents)
-        timing = {"abc": plan.timing, "semantic": semantic.timing, "nar_seconds": nar_seconds,
+        if on_stage is not None:
+            on_stage("decode")
+        try:
+            audio = self.decode(
+                latents, cancelled=cancelled) if cancelled is not None else self.decode(latents)
+        except torch.OutOfMemoryError as error:
+            torch.cuda.empty_cache()
+            raise MemoryError("VAE exceeded its runtime GPU allocation") from error
+        timing = {"abc": semantic.plan.timing, "semantic": semantic.timing, "nar_seconds": nar_result.seconds,
                   "vae_seconds": time.perf_counter() - vae_start, "load": dict(self.load_timing),
-                  "e2e_seconds": time.perf_counter() - start}
+                  "e2e_seconds": time.perf_counter() - ar_result.started_at}
+        config = dict(ar_result.config)
+        config.update(nar_execution="batched_padded" if nar_result.batch_size > 1 else "sequential",
+                      nar_batch_size=nar_result.batch_size, vae_execution="sequential")
         Progress(enabled=self.progress).complete(len(audio) / 48000, timing["e2e_seconds"],
-                                                truncated=plan.truncated or semantic.truncated)
-        return SongResult(audio, 48000, semantic, latents, config, self.weights, timing, request_id)
+                                                truncated=semantic.plan.truncated or semantic.truncated)
+        result = SongResult(audio, 48000, semantic, latents, config, self.weights,
+                            timing, ar_result.request_identity)
+        return result
+
+    def generate_batch(self, requests, **kwargs):
+        """Experimental batched AR forwards; see yue2.batching for limits."""
+        from .batching import generate_batch
+        return generate_batch(self, requests, **kwargs)
+
+    def __call__(self, style=None, lyrics=None, *, tags=None, abc_sampling=None,
+                 semantic_sampling=None, cancelled=None, on_token=None, on_stage=None, **kwargs):
+        ar_result = self.generate_ar(style, lyrics, tags=tags, abc_sampling=abc_sampling,
+                    semantic_sampling=semantic_sampling, cancelled=cancelled,
+                    on_token=on_token, on_stage=on_stage, **kwargs)
+        return self.render_ar(ar_result, cancelled=cancelled, on_stage=on_stage)
